@@ -17,7 +17,7 @@ import numpy as np
 OUT  = "/home/dishant/g1_ws/cumotion/config/g1_inspire_right.yml"
 PORT = 8080
 R, H = 0.036, 0.105                                   # the glass under test (3.6 cm radius, 10.5 cm tall)
-CX, CY = 0.40, -0.24                                  # starting position (robot's right)
+CX, CY = 0.32, -0.28                                  # starting position (robot's right)
 CZ = -0.006 + H / 2.0                                 # center; table top ~ -0.006 (glass sits on it)
 TABLE = [0.7, 0.9, 0.04], [0.60, -0.10, (CZ - H/2) - 0.025, 1, 0, 0, 0]   # back edge 0.25 clears the robot
 
@@ -25,13 +25,13 @@ TABLE = [0.7, 0.9, 0.04], [0.60, -0.10, (CZ - H/2) - 0.025, 1, 0, 0, 0]   # back
 SG_DX, SG_DYGAP, SG_FROMTOP, SG_APPROACH = 0.215, 0.01, 0.035, -0.05
 # FRONT grasp (new) defaults — the wrist position is DERIVED by rotating the side grasp by FG_YAW about the
 # cylinder axis; FG_DX/FG_DY are small fine-tune nudges on top. FG_YAW=-90 => palm +x, approach from the front.
-FG_DX, FG_DY, FG_FROMTOP, FG_APPROACH = 0.0, 0.0, 0.035, -0.05
+FG_DX, FG_DY, FG_FROMTOP, FG_APPROACH = 0.0, 0.0, 0.055, -0.05
 FG_YAW0, FG_PITCH0 = -90.0, 0.0                       # palm +y -> +x is yaw -90 about z
 
 HAND_JOINTS = ["right_thumb_1_joint","right_thumb_2_joint","right_index_1_joint",
                "right_middle_1_joint","right_ring_1_joint","right_little_1_joint"]
 HAND_OPEN   = dict(zip(HAND_JOINTS, [0,0,0,0,0,0]))
-HAND_CLOSED = dict(zip(HAND_JOINTS, [1.0,0.5,1.4,1.4,1.4,1.4]))
+HAND_CLOSED = dict(zip(HAND_JOINTS, [2.2,0.0,1.4,1.4,1.4,1.4]))
 HAND_LINKS = ["right_base_link","right_palm_force_sensor",
     "right_thumb_1","right_thumb_2","right_thumb_3","right_thumb_4",
     "right_thumb_force_sensor_1","right_thumb_force_sensor_2","right_thumb_force_sensor_3","right_thumb_force_sensor_4",
@@ -90,12 +90,15 @@ def main():
 
     is_moving = False
     server = viz._server
-    sl_fdx   = server.gui.add_slider("FG_DX fine-tune (x nudge)",      min=-0.10, max=0.10, step=0.005, initial_value=FG_DX)
-    sl_fdy   = server.gui.add_slider("FG_DY fine-tune (y nudge)",      min=-0.10, max=0.10, step=0.005, initial_value=FG_DY)
-    sl_fdz   = server.gui.add_slider("FG_FROMTOP (below top)",         min=-0.10, max=0.15, step=0.005, initial_value=FG_FROMTOP)
-    sl_fap   = server.gui.add_slider("FG_APPROACH (-x standoff)",      min=-0.20, max=-0.01, step=0.01, initial_value=FG_APPROACH)
-    sl_yaw   = server.gui.add_slider("FG_YAW deg (palm dir)",          min=-180.0, max=180.0, step=5.0, initial_value=FG_YAW0)
-    sl_pitch = server.gui.add_slider("FG_PITCH deg",                   min=-90.0, max=90.0, step=2.0, initial_value=FG_PITCH0)
+    # ALL buttons (Side/Front/Best) + Coverage read these live:
+    sl_dx    = server.gui.add_slider("SG_DX (reach / wrist behind)",   min=0.10, max=0.30, step=0.005, initial_value=SG_DX)
+    sl_dygap = server.gui.add_slider("SG_DYGAP (palm gap)",            min=-0.03, max=0.08, step=0.005, initial_value=SG_DYGAP)
+    sl_xoff  = server.gui.add_slider("WRIST X nudge (+ = ahead)",      min=-0.12, max=0.12, step=0.005, initial_value=0.01)
+    sl_yoff  = server.gui.add_slider("WRIST Y nudge (+ = right/-y)",   min=-0.12, max=0.12, step=0.005, initial_value=0.02)
+    sl_fdz   = server.gui.add_slider("FROMTOP (below top; bigger=lower)", min=-0.10, max=0.15, step=0.005, initial_value=FG_FROMTOP)
+    sl_fap   = server.gui.add_slider("APPROACH (tool standoff)",       min=-0.20, max=-0.01, step=0.01, initial_value=FG_APPROACH)
+    sl_yaw   = server.gui.add_slider("FG_YAW deg (front angle, 0=side)", min=-180.0, max=180.0, step=5.0, initial_value=FG_YAW0)
+    sl_pitch = server.gui.add_slider("PITCH deg (level pinky)",        min=-90.0, max=90.0, step=2.0, initial_value=FG_PITCH0)
     sl_grip  = server.gui.add_slider("GRIP (finger closure frac)",     min=0.2, max=1.0, step=0.05, initial_value=0.55)
 
     def cyl_center():
@@ -117,29 +120,28 @@ def main():
         d = np.linalg.norm(np.diff(P, axis=0), axis=1); mov = np.where(d > 1e-5)[0]
         return min(int(mov[-1] + 2) if len(mov) else Hn, Hn)
 
-    # --- the two grasp methods (return the plan_grasp result; None on failure) ---
-    def plan_side(cx, cy, cz, qstart):
-        top = cz + H/2.0
-        w = (cx - SG_DX, cy - (R + SG_DYGAP), top - SG_FROMTOP)
-        return planner.plan_grasp(goal(w, [1.,0,0,0]), qstart,
-            grasp_approach_axis="y", grasp_approach_offset=SG_APPROACH, grasp_approach_in_tool_frame=False,
-            grasp_lift_axis="z", grasp_lift_offset=0.15, grasp_lift_in_tool_frame=False,
-            plan_approach_to_grasp=True, plan_grasp_to_lift=True, disable_collision_links=HAND_LINKS), w
-    def plan_front(cx, cy, cz, qstart):
-        # FRONT = the side grasp ROTATED by FG_YAW about the cylinder's vertical axis, so the wrist offset
-        # rotates WITH the palm and the fingers still reach the glass. Approach is in the TOOL frame, so the
-        # hand comes in along its rotated approach direction (FG_YAW=-90 -> palm +x, approach from -x = front).
-        th = np.deg2rad(sl_yaw.value); c, s = np.cos(th), np.sin(th)
-        ox, oy = -SG_DX, -(R + SG_DYGAP)                       # side-grasp wrist offset (glass frame, xy)
-        wx = cx + (c*ox - s*oy) + sl_fdx.value                 # rotated offset + small x fine-tune
-        wy = cy + (s*ox + c*oy) + sl_fdy.value                 # rotated offset + small y fine-tune
-        wz = (cz + H/2.0) - sl_fdz.value
-        q = euler_quat(sl_yaw.value, sl_pitch.value)
-        return planner.plan_grasp(goal((wx, wy, wz), q), qstart,
-            grasp_approach_axis="y", grasp_approach_offset=sl_fap.value, grasp_approach_in_tool_frame=True,
+    # --- unified grasp: rotated by `yaw` about the cylinder axis; reads ALL sliders live, so every button
+    #     (Side/Front/Best) AND the Coverage sweep respond to SG_DX/SG_DYGAP/FROMTOP/APPROACH/PITCH. ---
+    def plan_at_yaw(cx, cy, cz, yaw, qstart):
+        dx, gap, fromtop, ap, pitch = sl_dx.value, sl_dygap.value, sl_fdz.value, sl_fap.value, sl_pitch.value
+        th = np.deg2rad(yaw); c, s = np.cos(th), np.sin(th); ox, oy = -dx, -(R + gap)
+        wx = cx + (c*ox - s*oy) + sl_xoff.value          # +x nudge = grasp more ahead
+        wy = cy + (s*ox + c*oy) - sl_yoff.value          # +nudge = grasp more right (-y)
+        wz = (cz + H/2.0) - fromtop
+        return planner.plan_grasp(goal((wx, wy, wz), euler_quat(yaw, pitch)), qstart,
+            grasp_approach_axis="y", grasp_approach_offset=ap, grasp_approach_in_tool_frame=True,
             grasp_lift_axis="z", grasp_lift_offset=0.15, grasp_lift_in_tool_frame=False,
             plan_approach_to_grasp=True, plan_grasp_to_lift=True, disable_collision_links=HAND_LINKS), (wx, wy, wz)
+    def plan_side(cx, cy, cz, qstart):  return plan_at_yaw(cx, cy, cz, 0, qstart)             # yaw 0 = current side
+    def plan_front(cx, cy, cz, qstart): return plan_at_yaw(cx, cy, cz, sl_yaw.value, qstart)  # the FG_YAW slider
     def ok(res): return res is not None and res.success is not None and bool(res.success.any())
+
+    YAW_SET = [0, -30, -60, -90]          # side -> front; "best angle" = most-front reachable
+    def plan_best(cx, cy, cz, qstart):    # sweep yaw from most-front toward side; take the first reachable
+        for yaw in YAW_SET[::-1]:
+            res, w = plan_at_yaw(cx, cy, cz, yaw, qstart)
+            if ok(res): print(f"  BEST reachable yaw = {yaw}deg"); return res, w
+        return None, (cx, cy, cz)
 
     def execute(seg, hand=None):
         nonlocal is_moving
@@ -185,33 +187,34 @@ def main():
     def coverage():
         def f():
             qstart = planner.kinematics.get_active_js(planner.default_joint_state.clone().unsqueeze(0))
-            XS = np.round(np.arange(0.30, 0.49, 0.03), 3)
-            YS = np.round(np.arange(-0.32, -0.02, 0.03), 3)
-            print("\n================ COVERAGE SWEEP (right-side placements) ================")
-            print(f"glass r={R} h={H}; rows=y (-0.02..-0.32), cols=x (0.30..0.48). "
-                  f"B=both S=side-only F=front-only .=neither")
-            ns = nf = nb = 0; grid = []
+            XS = np.round(np.arange(0.30, 0.49, 0.04), 3)
+            YS = np.round(np.arange(-0.32, -0.02, 0.04), 3)
+            tot = len(XS)*len(YS)
+            print(f"\n========= COVERAGE: side (yaw 0) vs BEST reachable angle, {tot} cells x {len(YAW_SET)} yaws =========")
+            print(f"  glass r={R} h={H}. cell = most-front reachable yaw: 0=side 1=-30 2=-60 3=-90, '.'=none. "
+                  f"(~takes a couple minutes)", flush=True)
+            ns = nany = nnew = 0; grid = []
             for y in YS:
                 row = []
                 for x in XS:
                     cz = (-0.006) + H/2.0
                     planner.update_world(build_scene(x, y, cz))
-                    s = ok(plan_side(x, y, cz, qstart)[0])
-                    fr = ok(plan_front(x, y, cz, qstart)[0])
-                    c = "B" if (s and fr) else "S" if s else "F" if fr else "."
-                    ns += s; nf += fr; nb += (s and fr); row.append(c)
-                grid.append((y, row))
-            hdr = "  y\\x  " + " ".join(f"{x:+.2f}" for x in XS); print(hdr)
-            for y, row in grid: print(f"  {y:+.2f} " + "    ".join(row))
-            tot = len(XS)*len(YS)
-            print(f"  side reachable: {ns}/{tot} | front reachable: {nf}/{tot} | both: {nb}/{tot}")
-            print("=======================================================================\n")
+                    reach = [yaw for yaw in YAW_SET if ok(plan_at_yaw(x, y, cz, yaw, qstart)[0])]
+                    side = (0 in reach); anyok = bool(reach); mostfront = min(reach) if reach else None
+                    sym = "." if not anyok else str(abs(mostfront)//30)
+                    ns += side; nany += anyok; nnew += (anyok and not side); row.append(sym)
+                grid.append((y, row)); print(f"  y={y:+.2f} " + " ".join(row), flush=True)
+            print("  cols x = " + " ".join(f"{x:.2f}" for x in XS))
+            print(f"  side(yaw 0): {ns}/{tot} | ANY-angle: {nany}/{tot} | NEW (front works, side fails): {nnew}/{tot}")
+            print("  => allowing front-ish angles adds %d cells over side-only." % nnew)
+            print("=================================================================================\n", flush=True)
             planner.update_world(build_scene(*cyl_center()))   # restore
         run_async(f)
 
-    server.gui.add_button("SideGrasp (current)", color="teal").on_click(lambda _: demo("SIDE", plan_side))
-    server.gui.add_button("FrontGrasp (new)", color="green").on_click(lambda _: demo("FRONT", plan_front))
-    server.gui.add_button("Coverage sweep (side vs front)", color="orange").on_click(lambda _: coverage())
+    server.gui.add_button("SideGrasp (yaw 0)", color="teal").on_click(lambda _: demo("SIDE", plan_side))
+    server.gui.add_button("FrontGrasp (FG_YAW)", color="green").on_click(lambda _: demo("FRONT", plan_front))
+    server.gui.add_button("BestAngle (most-front reachable)", color="green").on_click(lambda _: demo("BEST", plan_best))
+    server.gui.add_button("Coverage: side vs best-angle", color="orange").on_click(lambda _: coverage())
     print(f"\n================  OPEN  http://localhost:{PORT}  ================\n", flush=True)
     while True: time.sleep(1)
 

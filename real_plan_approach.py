@@ -66,6 +66,15 @@ def _seg_points(seg, interp_dt):
     return out
 
 
+def _qmul(a, b):  # [w,x,y,z]
+    aw, ax, ay, az = a; bw, bx, by, bz = b
+    return [aw*bw-ax*bx-ay*by-az*bz, aw*bx+ax*bw+ay*bz-az*by,
+            aw*by-ax*bz+ay*bw+az*bx, aw*bz+ax*by-ay*bx+az*bw]
+def euler_quat(yaw_deg, pitch_deg):  # qz(yaw) * qy(pitch) — yaw about z, then pitch about y
+    y = np.deg2rad(yaw_deg); p = np.deg2rad(pitch_deg)
+    return [float(v) for v in _qmul([np.cos(y/2),0,0,np.sin(y/2)], [np.cos(p/2),0,np.sin(p/2),0])]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pose", default="/tmp/glass_pose.json")
@@ -73,12 +82,17 @@ def main():
                     help="output trajectory JSON (default = GR00T repo scripts/, bind-mounted into the container)")
     ap.add_argument("--probe", action="store_true", help="sweep the grid, report reachability, auto-pick the best")
     ap.add_argument("--no-table", action="store_true", help="diagnostic: drop the table collision box")
-    ap.add_argument("--standoff", type=float, default=0.05, help="(non-probe) -y pre-grasp clearance from grasp pose")
-    ap.add_argument("--sg-dx", type=float, default=0.220, help="wrist x BEHIND glass (bigger=more behind; hand reaches fwd ~0.215)")
-    ap.add_argument("--dygap", type=float, default=0.01, help="palm-to-glass -y gap (bigger=hand more to the RIGHT)")
-    ap.add_argument("--from-top", type=float, default=0.035, help="wrist z below glass top (BIGGER value = LOWER hand)")
-    ap.add_argument("--pitch-deg", type=float, default=0.0,
-                    help="tilt the grasp hand about the lateral axis to level the pinky (+ = pitch fingers up)")
+    # BestAngle grasp params (tuned in sim_grasp_viz; rotate the grasp by yaw about the cylinder axis)
+    ap.add_argument("--standoff", type=float, default=0.05, help="pre-grasp clearance (tool-frame approach offset)")
+    ap.add_argument("--sg-dx", type=float, default=0.215, help="reach: wrist behind the glass along the finger axis")
+    ap.add_argument("--dygap", type=float, default=0.01, help="palm-to-glass gap")
+    ap.add_argument("--from-top", type=float, default=0.055, help="wrist z below glass top (BIGGER value = LOWER hand)")
+    ap.add_argument("--xoff", type=float, default=0.01, help="wrist X nudge (+ = grasp more ahead)")
+    ap.add_argument("--yoff", type=float, default=0.02, help="wrist Y nudge (+ = grasp more right / -y)")
+    ap.add_argument("--pitch-deg", type=float, default=0.0, help="tilt the hand about the lateral axis to level the pinky")
+    ap.add_argument("--yaws", type=int, nargs="+", default=[0, -30, -60, -90],
+                    help="BestAngle yaw set (deg): 0=side, -90=front. Sweeps MOST-FRONT first, takes first reachable")
+    ap.add_argument("--yaw", type=int, default=None, help="force a single yaw (skip the BestAngle sweep)")
     ap.add_argument("--start-q", type=float, nargs=7, default=[0.0]*7)
     args = ap.parse_args()
 
@@ -118,60 +132,39 @@ def main():
 
     qs = JointState.from_position(torch.tensor([args.start_q], device="cuda", dtype=torch.float32), joint_names=ARM_JOINTS)
 
-    def wrist_of(dx, so, ft):
-        return cx - dx, cy - (R + args.dygap) - so, topz - ft
-
-    def try_plan(x, y, z, attempts):
+    # ---- BestAngle (== sim_grasp_viz): rotate the grasp by `yaw` about the cylinder axis (0=side, -90=front);
+    #      the wrist offset rotates WITH the palm so the fingers always reach the glass, and the approach is in
+    #      the TOOL frame so the hand comes in from the rotated direction. Sweep MOST-FRONT first, keep the first
+    #      reachable. Hand-link collisions disabled so the open hand can sit at the glass. ----
+    def plan_grasp_yaw(yaw):
+        th = np.deg2rad(yaw); c, s = np.cos(th), np.sin(th); ox, oy = -args.sg_dx, -(R + args.dygap)
+        wx = cx + (c*ox - s*oy) + args.xoff          # +xoff = grasp more ahead
+        wy = cy + (s*ox + c*oy) - args.yoff          # +yoff = grasp more right (-y)
+        wz = topz - args.from_top
+        q = euler_quat(yaw, args.pitch_deg)
         goal = GoalToolPose(tool_frames=pl.tool_frames,
-                            position=torch.tensor([[[[[x, y, z]]]]], device="cuda", dtype=torch.float32),
-                            quaternion=torch.tensor([[[[[1., 0, 0, 0]]]]], device="cuda", dtype=torch.float32))
-        res = pl.plan_pose(goal, qs, max_attempts=attempts, use_implicit_goal=True)
+                            position=torch.tensor([[[[[wx, wy, wz]]]]], device="cuda", dtype=torch.float32),
+                            quaternion=torch.tensor([[[[[q[0], q[1], q[2], q[3]]]]]], device="cuda", dtype=torch.float32))
+        res = pl.plan_grasp(goal, qs, grasp_approach_axis="y", grasp_approach_offset=-args.standoff, grasp_approach_in_tool_frame=True,
+                            grasp_lift_axis="z", grasp_lift_offset=0.15, grasp_lift_in_tool_frame=False,
+                            plan_approach_to_grasp=True, plan_grasp_to_lift=True, disable_collision_links=HAND_LINKS)
         ok = res is not None and res.success is not None and bool(res.success.any())
-        return ok, res
+        return ok, res, (wx, wy, wz)
 
-    # ---- choose the geometry (sg_dx, standoff=-y approach offset, from_top) ----
-    if args.probe:
-        print("[probe] sweeping pre-grasp poses (PASS = reachable) ...")
-        reach = []
-        for dx in DX_GRID:
-            for so in STANDOFF_GRID:
-                for ft in FROMTOP_GRID:
-                    x, y, z = wrist_of(dx, so, ft)
-                    ok, _ = try_plan(x, y, z, attempts=4)
-                    print(f"  [{'PASS' if ok else 'fail'}] dx={dx:.2f} standoff={so:.2f} from_top={ft:+.2f} "
-                          f"-> pre-grasp wrist=({x:+.3f},{y:+.3f},{z:+.3f})")
-                    if ok:
-                        reach.append((dx, so, ft))
-        if not reach:
-            print("[probe] ❌ NOTHING reachable near the glass. Glass too low/close for the right arm OR the "
-                  "camera->base extrinsic has a z/x error. Verify the base pose / extrinsic next.")
-            return 1
-        dx, so, ft = min(reach, key=lambda r: (abs(r[0]-SIM_DX), abs(r[1]-SIM_STANDOFF), abs(r[2]-SIM_FROMTOP)))
-        print(f"[probe] {len(reach)} reachable. PICK (closest to sim grasp): dx={dx:.3f} standoff={so:.2f} from_top={ft:+.3f}")
-    else:
-        dx, so, ft = args.sg_dx, args.standoff, args.from_top
-
-    # GRASP pose = wrist sg_dx behind the glass, at its -y surface+gap, from_top below top (== Viser SideGrasp pose)
-    ggx, ggy, ggz = cx - dx, cy - (R + args.dygap), topz - ft
-    fwd = cx - ggx
-    print(f"[plan] GRASP wrist=({ggx:+.3f},{ggy:+.3f},{ggz:+.3f})  [sg_dx={dx} dygap={args.dygap} from_top={ft}; "
-          f"approach standoff={so:.2f} on -y]  -> fingers reach ~{fwd:.2f}m fwd to the glass. glass=({cx:+.3f},{cy:+.3f})")
-
-    # ---- plan_grasp: approach(-y) -> grasp -> lift, hand-link collisions disabled so the OPEN hand can sit at
-    #      the glass (plan_pose would reject it). We export approach+grasp (NOT lift, NOT fingers) = SideGrasp's path.
-    p = np.deg2rad(args.pitch_deg); qw, qy = float(np.cos(p/2)), float(np.sin(p/2))   # tilt about lateral axis
-    print(f"[plan] grasp pitch={args.pitch_deg:+.1f}deg -> quat=[{qw:.3f},0,{qy:.3f},0]")
-    goal = GoalToolPose(tool_frames=pl.tool_frames,
-                        position=torch.tensor([[[[[ggx, ggy, ggz]]]]], device="cuda", dtype=torch.float32),
-                        quaternion=torch.tensor([[[[[qw, 0., qy, 0.]]]]], device="cuda", dtype=torch.float32))
-    res = pl.plan_grasp(goal, qs, grasp_approach_axis="y", grasp_approach_offset=-so, grasp_approach_in_tool_frame=False,
-                        grasp_lift_axis="z", grasp_lift_offset=0.15, grasp_lift_in_tool_frame=False,
-                        plan_approach_to_grasp=True, plan_grasp_to_lift=True, disable_collision_links=HAND_LINKS)
-    ok = res is not None and res.success is not None and bool(res.success.any())
-    if not ok:
-        print("[plan] ❌ plan_grasp FAILED status=", getattr(res, "status", None),
-              "\n   -> adjust --sg-dx/--dygap/--from-top/--standoff or re-emit a fresh pose.")
+    yaws = [args.yaw] if args.yaw is not None else sorted(args.yaws, key=lambda v: abs(v), reverse=True)  # most-front first
+    print(f"[plan] BestAngle sweeping yaw {yaws}  (sg_dx={args.sg_dx} dygap={args.dygap} from_top={args.from_top} "
+          f"xoff={args.xoff} yoff={args.yoff} pitch={args.pitch_deg} standoff={args.standoff}) ...")
+    chosen = None
+    for yaw in yaws:
+        okk, res, w = plan_grasp_yaw(yaw)
+        print(f"  [{'OK ' if okk else 'fail'}] yaw={yaw:+d}deg wrist=({w[0]:+.3f},{w[1]:+.3f},{w[2]:+.3f})"
+              + ("" if okk else f"  {getattr(res, 'status', None)}"))
+        if okk: chosen = (yaw, res, w); break
+    if chosen is None:
+        print("[plan] ❌ no reachable yaw — adjust --from-top/--xoff/--yoff/--sg-dx or re-emit a fresh pose.")
         return 1
+    yaw, res, (ggx, ggy, ggz) = chosen
+    print(f"[plan] ✅ BEST yaw={yaw:+d}deg  GRASP wrist=({ggx:+.3f},{ggy:+.3f},{ggz:+.3f})  glass=({cx:+.3f},{cy:+.3f})")
 
     ap_pts = _seg_points(res.approach_interpolated_trajectory, interp_dt)
     gr_pts = _seg_points(res.grasp_interpolated_trajectory, interp_dt)
@@ -184,7 +177,7 @@ def main():
     print(f"[plan] end_q (GRASP pose) ={['%+.3f'%v for v in pts[-1][0]]}")
     print(f"[plan] lifted_q          ={['%+.3f'%v for v in lf_pts[-1][0]]}")
     out = {"joint_names": ARM_JOINTS, "interp_dt": float(interp_dt), "slow": SLOW,
-           "target_wrist": [ggx, ggy, ggz], "glass": P,
+           "target_wrist": [ggx, ggy, ggz], "yaw": yaw, "glass": P,
            "points": [{"positions": p, "time": t, "velocities": v} for (p, t, v) in pts],
            "lift_points": [{"positions": p, "time": t, "velocities": v} for (p, t, v) in lf_pts]}
     with open(args.out, "w") as f:
