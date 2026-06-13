@@ -8,12 +8,18 @@ A real-robot **pick pipeline** for a Unitree G1 humanoid + Inspire FTP right han
 depth → detect a coloured cup → cuRobo `plan_grasp` → drive the right arm (Unitree SDK) and close
 the Inspire hand → lift. There is **no AprilTag** and **no ROS** anywhere in the path.
 
-This folder is an **aggregation layer**, not a self-contained repo. Most entries are **symlinks** to
-the live sources elsewhere on this machine (so there's no drift). The only first-party files committed
-here are **`real_pick.py`** and **`go_to_start.py`**. The symlinked planner/viz/detector/server live in
-`/home/dishant/g1_ws/...` and `/home/dishant/Projects/xr_teleoperate/...`. When editing a symlinked file
-you are editing the live source — confirm before doing so. `config/`, `curobo/`, `inspire_hand_sdk/` are
-symlinked directories (robot config, the cuRobo repo, the Inspire SDK).
+This folder began as an aggregation layer of **symlinks** to live sources, but has since been
+**vendored**: every entry is now a real committed copy (remote `dishantpatel-GH/g1_real_pick`).
+First-party code is `real_pick.py`, `go_to_start.py`, and the planner/viz/detector/server scripts
+(`real_plan_approach.py`, `real_viz.py`, `sim_grasp_viz.py`, `object_detection.py`, `image_server.py`),
+originally authored under `/home/dishant/g1_ws/...`. `config/` is the robot config, `inspire_hand_sdk/`
+is the Inspire SDK, and `curobo/` is a vendored copy of **NVlabs/curobo @ v0.8.0 (ac5f931)** with its
+`.git` stripped.
+
+**The copies have diverged from the symlink era:** editing a file here no longer changes the live source
+under `/home/dishant/g1_ws/...` or `/home/dishant/Projects/...` (or vice-versa). The repo is a snapshot,
+**not yet portable** — absolute paths are still baked into the scripts (`CONFIG`, `DEFAULT_TRAJ`, the
+`cumotion_venv` interpreter, the GR00T `--out` dir); fix those before cloning to another machine.
 
 ## The three-environment split (the central architectural constraint)
 

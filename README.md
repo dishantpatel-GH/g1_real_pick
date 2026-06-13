@@ -1,8 +1,9 @@
 # g1_real_pick — depth-driven cuMotion pick for the real Unitree G1 + Inspire FTP hand
 
 One folder gathering everything for the real pick: **image server**, **cuRobo** (planner + config +
-viewer), the **approach/grasp/lift** scripts, and the **inspire hand SDK**. Most entries are symlinks to the
-live sources on this machine (so there's no drift) — the only first-party file here is **`real_pick.py`**.
+viewer), the **approach/grasp/lift** scripts, and the **inspire hand SDK**. Entries were originally
+symlinks to the live sources on this machine; they are now **vendored copies** committed to git so the
+repo is self-contained (`curobo/` is NVlabs/curobo @ v0.8.0, `.git` stripped).
 
 Pipeline: head **RealSense depth** (no AprilTag) → **cuRobo `plan_grasp`** → drive the G1 right arm
 (Unitree SDK) + close the Inspire FTP hand → lift.
@@ -55,7 +56,9 @@ dry-runs by default; the arm holds the grasp pose in a background thread while t
 The arm can only reach a limited band (fixed base) — keep the glass in the reachable zone the planner/viz confirm.
 
 ## Notes
-- Entries are **symlinks** to the live sources (machine-local). To make this a portable/cloneable repo, replace
-  the symlinks with copies and fix the absolute paths (cuRobo `CONFIG`, the traj `--traj`/`--out` defaults).
+- Entries are now **vendored copies** (no longer symlinks), so they no longer track the live sources under
+  `/home/dishant/g1_ws/...` — edits here and there have diverged. The repo is still NOT portable to another
+  machine: absolute paths remain baked in (cuRobo `CONFIG`, the traj `--traj`/`--out` defaults, the
+  `cumotion_venv` interpreter) — fix those before cloning elsewhere.
 - cuRobo planning stays a separate step because its env can't be merged with the Unitree/Inspire SDKs without a
   heavy rebuild. `real_pick.py` consumes the planned trajectory file.
