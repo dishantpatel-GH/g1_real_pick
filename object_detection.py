@@ -74,13 +74,32 @@ def split_color(payload):
     return arr[:, :w].copy()       # BGR color, aligned to depth_raw
 
 
-def get_intr(payload):
+def _pick(d, *keys):
+    for k in keys:
+        if d.get(k) is not None:
+            return d[k]
+    return None
+
+
+def get_intr(payload, frame_shape=None):
+    """Normalised intrinsics with fx/fy/ppx/ppy/depth_scale. The image_server publishes the
+    principal point as cx/cy (not ppx/ppy) — alias it; fall back to the image centre if absent."""
     intr = payload.get("intrinsics")
     if not intr:
-        print("[warn] server published no intrinsics — using D435 fallback (run the patched image_server.py).")
-        intr = dict(_FALLBACK_INTR)
-    intr.setdefault("depth_scale", 0.001)
-    return intr
+        print("[warn] server published no intrinsics — using D435 fallback.")
+        return dict(_FALLBACK_INTR)
+    fx = _pick(intr, "fx", "focal_x"); fy = _pick(intr, "fy", "focal_y")
+    ppx = _pick(intr, "ppx", "cx", "principal_x"); ppy = _pick(intr, "ppy", "cy", "principal_y")
+    width = _pick(intr, "width", "w"); height = _pick(intr, "height", "h")
+    if fx is None or fy is None:
+        fx = fx if fx is not None else _FALLBACK_INTR["fx"]; fy = fy if fy is not None else _FALLBACK_INTR["fy"]
+    if ppx is None or ppy is None:
+        H, W = (frame_shape[0], frame_shape[1]) if frame_shape is not None else \
+               (height or _FALLBACK_INTR["height"], width or _FALLBACK_INTR["width"])
+        ppx = ppx if ppx is not None else W / 2.0; ppy = ppy if ppy is not None else H / 2.0
+    out = dict(intr); out.update(fx=float(fx), fy=float(fy), ppx=float(ppx), ppy=float(ppy))
+    out.setdefault("depth_scale", 0.001)
+    return out
 
 
 def detect(color_bgr, depth_m, intr, hsv_lo, hsv_hi, min_area):
@@ -228,7 +247,7 @@ def main():
                 if args.once:
                     sys.exit(2)
                 continue
-            intr = get_intr(payload)
+            intr = get_intr(payload, frame_shape=color.shape)
 
             if args.calibrate:
                 calibrate(color)

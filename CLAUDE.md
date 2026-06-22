@@ -11,10 +11,21 @@ the Inspire hand → lift. There is **no AprilTag** and **no ROS** anywhere in t
 This folder began as an aggregation layer of **symlinks** to live sources, but has since been
 **vendored**: every entry is now a real committed copy (remote `dishantpatel-GH/g1_real_pick`).
 First-party code is `real_pick.py`, `go_to_start.py`, and the planner/viz/detector/server scripts
-(`real_plan_approach.py`, `real_viz.py`, `sim_grasp_viz.py`, `object_detection.py`, `image_server.py`),
-originally authored under `/home/dishant/g1_ws/...`. `config/` is the robot config, `inspire_hand_sdk/`
-is the Inspire SDK, and `curobo/` is a vendored copy of **NVlabs/curobo @ v0.8.0 (ac5f931)** with its
-`.git` stripped.
+(`real_plan_approach.py`, `real_viz.py`, `sim_grasp_viz.py`, `grasp_coverage_map.py`,
+`object_detection.py`, `image_server.py`), originally authored under `/home/dishant/g1_ws/...`.
+`inspire_hand_sdk/` is the Inspire SDK. `config/` holds a *snapshot* of the robot config
+(`g1_inspire_right.yml`, `g1_inspire_cumotion.urdf`) — but the scripts do **NOT** read it: they hardcode
+`/home/dishant/g1_ws/cumotion/config/g1_inspire_right.yml` (as `CONFIG`/`OUT`), so editing the repo's
+`config/` changes nothing until you repoint those constants.
+
+`curobo/` is a vendored copy of **NVlabs/curobo — a post-0.8.0, unreleased dev snapshot** (`.git`
+stripped, so there's no exact commit hash; the CHANGELOG's top section is `## Latest Commit`, sitting
+*above* `## Version 0.8.0`). It uses the **redesigned API, NOT v0.8.0's `MotionGen`**: the package lives
+flat at `curobo/curobo/` (not `src/curobo/`), and the planner entry points are
+`from curobo import MotionPlanner, MotionPlannerCfg`; `Scene`/`Cuboid`/`Cylinder`/`Mesh` from
+`curobo.scene`; `GoalToolPose`/`JointState` from `curobo.types`; and `MotionPlanner.plan_grasp(...)`
+(implemented in `curobo/curobo/_src/motion/motion_planner.py`). Don't go looking for
+`wrap/reacher/motion_gen.py` — it does not exist in this tree.
 
 **The copies have diverged from the symlink era:** editing a file here no longer changes the live source
 under `/home/dishant/g1_ws/...` or `/home/dishant/Projects/...` (or vice-versa). The repo is a snapshot,
@@ -74,6 +85,12 @@ real_pick.py --traj approach_traj.json  -->  drives arm + hand
   `real_plan_approach.py` and `real_viz.py`. The wrist sits ~`sg_dx` (≈0.215 m) **behind** the glass in
   x because the hand reaches forward ~0.215 m. Tune them in `real_viz.py` (browser, localhost:8080)
   watching where the hand lands, then bake the values into `real_plan_approach.py`.
+- **The executed grasp is a SIDE grasp** — approach from the robot's right (`grasp_approach_axis="y"`),
+  palm facing +y. The **FRONT grasp** (approach head-on from −x) only exists in the offline exploration
+  tools `sim_grasp_viz.py` (browser: side-vs-front comparison + coverage) and `grasp_coverage_map.py`
+  (top-down reachability PNG, sweeping yaws `[0,-30,-60,-90]`); it is **not** wired into
+  `real_plan_approach.py`/`real_pick.py`. Use these two tools to decide whether a target glass position is
+  reachable at all before planning.
 - The planner disables collisions on `HAND_LINKS` during `plan_grasp` so the open hand may sit touching
   the glass; and fixes the table box at `x=0.60` (back edge 0.25) so it clears the fixed-base robot —
   centering the table on the glass buries the arms-0 start inside the slab and **every plan returns None**.
@@ -104,6 +121,9 @@ python object_detection.py --calibrate                # click the cup to read it
 # plan (cumotion_venv) — --probe sweeps a reachability grid and auto-picks:
 /home/dishant/cumotion_venv/bin/python real_plan_approach.py --pose /tmp/glass_pose.json --probe
 /home/dishant/cumotion_venv/bin/python real_viz.py            # browser tuner, http://localhost:8080
+# reachability exploration (cumotion_venv, offline — not part of the pick path):
+/home/dishant/cumotion_venv/bin/python sim_grasp_viz.py                                  # browser: SIDE vs FRONT + coverage
+/home/dishant/cumotion_venv/bin/python grasp_coverage_map.py --out /tmp/grasp_coverage.png  # top-down reachability PNG
 # execute (tv) — dry-run first, then --execute:
 python go_to_start.py            # park arm at sim start (add --execute)
 python real_pick.py              # full pick: approach→grasp→lift (add --execute)

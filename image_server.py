@@ -104,19 +104,6 @@ class RealSenseCamera:
                 logger_mp.warning(f'[RealSense] Warm-up frame {i} failed: {e}')
         logger_mp.info(f'[RealSense {self.serial_number}] Ready')
 
-    def reset(self):
-        """Tear down and reinitialise the streaming pipeline.
-
-        Used by ImageServer to recover from transient frame timeouts (USB
-        hiccups, autosuspend wake races, etc.) without restarting the process.
-        """
-        try:
-            self.pipeline.stop()
-        except Exception as e:
-            logger_mp.warning(f'[RealSense {self.serial_number}] pipeline.stop during reset failed: {e}')
-        time.sleep(0.5)
-        self._init_pipeline()
-
     def get_frame(self):
         """Returns (color_image, depth_image). depth_image is None if depth disabled."""
         try:
@@ -143,17 +130,6 @@ class RealSenseCamera:
 
     def release(self):
         self.pipeline.stop()
-
-    def get_intrinsics_dict(self):
-        """Color-stream intrinsics (depth is aligned to color, so these apply to depth_raw too)
-        + depth scale (raw_uint16 * depth_scale = metres). Published so a client can deproject."""
-        i = self.intrinsics
-        d = {'fx': float(i.fx), 'fy': float(i.fy), 'ppx': float(i.ppx), 'ppy': float(i.ppy),
-             'width': int(i.width), 'height': int(i.height),
-             'model': str(i.model), 'coeffs': [float(c) for c in i.coeffs]}
-        if self.enable_depth:
-            d['depth_scale'] = float(self.g_depth_scale)
-        return d
 
     def log_info(self, label):
         logger_mp.info(f"[Image Server] {label} camera {self.serial_number} resolution: {self.img_shape[0]}x{self.img_shape[1]}")
@@ -184,19 +160,6 @@ class OpenCVCamera:
 
     def release(self):
         self.cap.release()
-
-    def reset(self):
-        """Reopen the V4L2 capture. Mirrors RealSenseCamera.reset()."""
-        try:
-            self.cap.release()
-        except Exception as e:
-            logger_mp.warning(f'[OpenCVCamera {self.id}] release during reset failed: {e}')
-        time.sleep(0.5)
-        self.cap = cv2.VideoCapture(self.id, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.img_shape[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.img_shape[1])
-        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
     def get_frame(self):
         """Returns (color_image, None) to match RealSenseCamera interface."""
@@ -249,18 +212,8 @@ class ImageServer:
             config.get('wrist_camera_id_numbers'),
         )
 
-        # Head-camera intrinsics + depth scale, published once per frame so a detection client
-        # (object_detection.py) can deproject depth_raw to 3D without owning the camera.
-        self.head_intrinsics = None
-        if self.head_cameras and isinstance(self.head_cameras[0], RealSenseCamera):
-            self.head_intrinsics = self.head_cameras[0].get_intrinsics_dict()
-            logger_mp.info(f"[Image Server] Head intrinsics: {self.head_intrinsics}")
-
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        # Cap outbound buffer to 1 frame so we never publish stale frames.
-        # Without this the kernel/ZMQ buffer can hold hundreds of frames if
-        # any client briefly stalls, and the client then plays the backlog.
         self.socket.setsockopt(zmq.SNDHWM, 1)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.bind(f"tcp://*:{port}")
@@ -338,61 +291,75 @@ class ImageServer:
         logger_mp.info("[Image Server] The server has been closed.")
 
     def send_process(self):
-        # Auto-recovery: tolerate transient frame-read failures by stopping and
-        # restarting each camera pipeline rather than crashing the process.
-        # After MAX_CONSECUTIVE_FAILURES bad cycles we give up and exit so a
-        # supervisor (systemd, screen, tmux) can decide what to do.
-        MAX_CONSECUTIVE_FAILURES = 30
-        consecutive_failures = 0
+        frame_count = 0
+        log_interval = 30  # Log every 30 frames (~1 sec at 30fps)
         try:
             while True:
+                t_capture_start = time.time()
+
                 head_frames, raw_depth = self._capture_frames(self.head_cameras, "Head")
                 if not head_frames:
-                    consecutive_failures += 1
-                    logger_mp.warning(
-                        f"[Image Server] Frame read failed "
-                        f"({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}); "
-                        f"attempting camera recovery."
-                    )
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        logger_mp.error(
-                            f"[Image Server] Giving up after "
-                            f"{MAX_CONSECUTIVE_FAILURES} consecutive frame failures."
-                        )
-                        break
-                    for cam in self.head_cameras + self.wrist_cameras:
-                        try:
-                            cam.reset()
-                        except Exception as e:
-                            logger_mp.error(f"[Image Server] Camera reset failed: {e}")
-                    time.sleep(0.5)
-                    continue
-                consecutive_failures = 0
-                head_combined = cv2.hconcat(head_frames)
+                    break
+                combined = cv2.hconcat(head_frames)
 
-                wrist_combined = None
                 if self.wrist_cameras:
                     wrist_frames, _ = self._capture_frames(self.wrist_cameras, "Wrist")
                     if wrist_frames:
                         wrist_combined = cv2.hconcat(wrist_frames)
+                        if wrist_combined.shape[0] != combined.shape[0]:
+                            target_h = combined.shape[0]
+                            scale = target_h / wrist_combined.shape[0]
+                            target_w = int(wrist_combined.shape[1] * scale)
+                            wrist_combined = cv2.resize(wrist_combined, (target_w, target_h))
+                        combined = cv2.hconcat([combined, wrist_combined])
 
-                jpg_params = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-                ret_h, head_buf = cv2.imencode('.jpg', head_combined, jpg_params)
-                if not ret_h:
-                    logger_mp.error("[Image Server] Head imencode failed.")
+                t_encode_start = time.time()
+                ret, buffer = cv2.imencode('.jpg', combined, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if not ret:
+                    logger_mp.error("[Image Server] Frame imencode failed.")
                     continue
+                t_encode_end = time.time()
 
-                payload = {
-                    'image': head_buf.tobytes(),
+                jpg_bytes = buffer.tobytes()
+                # Pull intrinsics from the first head camera (they're
+                # identical for all cameras at the same resolution).
+                _intr = None
+                if self.head_cameras:
+                    _i = self.head_cameras[0].intrinsics
+                    _intr = {
+                        'fx': float(_i.fx), 'fy': float(_i.fy),
+                        'cx': float(_i.ppx), 'cy': float(_i.ppy),
+                        'width': int(_i.width), 'height': int(_i.height),
+                    }
+                    # publish the real device depth scale (metres per raw unit) so clients
+                    # deproject with the true scale instead of assuming the D435 default 0.001.
+                    _ds = getattr(self.head_cameras[0], 'g_depth_scale', None)
+                    if _ds is not None:
+                        _intr['depth_scale'] = float(_ds)
+                message = pickle.dumps({
+                    'image': jpg_bytes,
                     'depth_raw': raw_depth,
-                    'intrinsics': self.head_intrinsics,
-                }
-                if wrist_combined is not None:
-                    ret_w, wrist_buf = cv2.imencode('.jpg', wrist_combined, jpg_params)
-                    if ret_w:
-                        payload['wrist_image'] = wrist_buf.tobytes()
+                    'intrinsics': _intr,
+                    'timestamp': time.time(),
+                    'frame_id': frame_count,
+                })
 
-                self.socket.send(pickle.dumps(payload), flags=zmq.NOBLOCK if False else 0)
+                t_send_start = time.time()
+                self.socket.send(message)
+                t_send_end = time.time()
+
+                frame_count += 1
+                if frame_count % log_interval == 0:
+                    capture_ms = (t_encode_start - t_capture_start) * 1000
+                    encode_ms = (t_encode_end - t_encode_start) * 1000
+                    send_ms = (t_send_end - t_send_start) * 1000
+                    total_ms = (t_send_end - t_capture_start) * 1000
+                    size_kb = len(jpg_bytes) / 1024
+                    logger_mp.info(
+                        f"[Server Latency] capture={capture_ms:.1f}ms  encode={encode_ms:.1f}ms  "
+                        f"send={send_ms:.1f}ms  total={total_ms:.1f}ms  size={size_kb:.0f}KB  "
+                        f"frame={frame_count}  res={combined.shape[1]}x{combined.shape[0]}"
+                    )
 
                 if self.Unit_Test:
                     t = time.time()
@@ -421,71 +388,50 @@ if __name__ == "__main__":
     parser.add_argument('--wrist', type=int, nargs='+', default=[], help='Wrist camera ports (empty or -1 to disable)')
     parser.add_argument('--no-depth', action='store_true', help='Disable depth')
     parser.add_argument('--no-wrist', action='store_true', help='Disable wrist cameras')
-    parser.add_argument('--no-realsense', action='store_true', help='Disable RealSense head camera (wrist-only mode)')
     parser.add_argument('--depth-near', type=int, default=250, help='Depth near plane (mm)')
     parser.add_argument('--depth-far', type=int, default=4000, help='Depth far plane (mm)')
     parser.add_argument('--depth-style', type=str, default='turbo', choices=['3ddp', 'turbo', 'jet'],
                         help='3ddp=3D-Diffusion-Policy style (u,v,depth as RGB), turbo/jet=colormap')
-    parser.add_argument('--resolution', type=str, default='640x480', help='Head camera: WxH')
+    parser.add_argument('--resolution', type=str, default='1280x720', help='Head camera: WxH')
     parser.add_argument('--wrist-resolution', type=str, default='640x480', help='Wrist camera: WxH')
     args = parser.parse_args()
 
+    # Auto-detect RealSense
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        print("ERROR: No RealSense camera found!")
+        exit(1)
+    serial = devices[0].get_info(rs.camera_info.serial_number)
+    print(f"[AUTO] RealSense: {serial}")
+
     wrist_ports = [] if args.no_wrist or args.wrist == [-1] else args.wrist
-    head_shape = _parse_resolution(args.resolution, [480, 640])
+    head_shape = _parse_resolution(args.resolution, [720, 1280])
     wrist_shape = _parse_resolution(args.wrist_resolution, [480, 640])
 
-    if args.no_realsense:
-        if not wrist_ports:
-            print("ERROR: --no-realsense requires at least one --wrist port (no head camera + no wrist = nothing to send).")
-            exit(1)
-        config = {
-            'fps': 30,
-            'head_camera_type': 'opencv',
-            'head_camera_image_shape': wrist_shape,
-            'head_camera_id_numbers': [wrist_ports[0]],
-            'enable_depth': False,
-        }
-        extra_wrist_ports = wrist_ports[1:]
-        if extra_wrist_ports:
-            config['wrist_camera_type'] = 'opencv'
-            config['wrist_camera_image_shape'] = wrist_shape
-            config['wrist_camera_id_numbers'] = extra_wrist_ports
+    config = {
+        'fps': 30,
+        'head_camera_type': 'realsense',
+        'head_camera_image_shape': head_shape,
+        'head_camera_id_numbers': [serial],
+        'enable_depth': not args.no_depth,
+        'depth_near_mm': args.depth_near,
+        'depth_far_mm': args.depth_far,
+        'depth_style': args.depth_style,
+    }
+    if wrist_ports:
+        config['wrist_camera_type'] = 'opencv'
+        config['wrist_camera_image_shape'] = wrist_shape
+        config['wrist_camera_id_numbers'] = wrist_ports
 
-        print("[CONFIG] RealSense: DISABLED (--no-realsense)")
-        print(f"[CONFIG] Head (OpenCV) port: {wrist_ports[0]} @ {wrist_shape[1]}x{wrist_shape[0]}")
-        print(f"[CONFIG] Wrist: {extra_wrist_ports if extra_wrist_ports else 'DISABLED'}")
-    else:
-        # Auto-detect RealSense
-        ctx = rs.context()
-        devices = ctx.query_devices()
-        if len(devices) == 0:
-            print("ERROR: No RealSense camera found!")
-            exit(1)
-        serial = devices[0].get_info(rs.camera_info.serial_number)
-        print(f"[AUTO] RealSense: {serial}")
-
-        config = {
-            'fps': 30,
-            'head_camera_type': 'realsense',
-            'head_camera_image_shape': head_shape,
-            'head_camera_id_numbers': [serial],
-            'enable_depth': not args.no_depth,
-            'depth_near_mm': args.depth_near,
-            'depth_far_mm': args.depth_far,
-            'depth_style': args.depth_style,
-        }
-        if wrist_ports:
-            config['wrist_camera_type'] = 'opencv'
-            config['wrist_camera_image_shape'] = wrist_shape
-            config['wrist_camera_id_numbers'] = wrist_ports
-
-        print(f"[CONFIG] Head resolution: {head_shape[1]}x{head_shape[0]}")
-        print(f"[CONFIG] Head: RealSense RGB + {'Depth' if config['enable_depth'] else 'No Depth'}")
-        if config['enable_depth']:
-            print(f"[CONFIG] Depth: {config['depth_near_mm']}-{config['depth_far_mm']}mm, style={config['depth_style']}")
-        if wrist_ports:
-            print(f"[CONFIG] Wrist resolution: {wrist_shape[1]}x{wrist_shape[0]}")
-        print(f"[CONFIG] Wrist: {wrist_ports if wrist_ports else 'DISABLED'}")
+    print(f"[CONFIG] Head resolution: {head_shape[1]}x{head_shape[0]}")
+    print(f"[CONFIG] Head: RealSense RGB + {'Depth' if config['enable_depth'] else 'No Depth'}")
+    if config['enable_depth']:
+        print(f"[CONFIG] Depth: {config['depth_near_mm']}-{config['depth_far_mm']}mm, style={config['depth_style']}")
+    if wrist_ports:
+        print(f"[CONFIG] Wrist resolution: {wrist_shape[1]}x{wrist_shape[0]}")
+    print(f"[CONFIG] Wrist: {wrist_ports if wrist_ports else 'DISABLED'}")
 
     server = ImageServer(config, Unit_Test=False)
     server.send_process()
+
