@@ -25,18 +25,19 @@ PORT = 8081
 POSE_JSON = "/tmp/microwave_pose.json"     # written by microwave_handle_real.py
 TRAJ_JSON = "/tmp/door_open_traj.json"     # written by real_plan_door.py (the plan to replay / run on the robot)
 
-# ---- Z LIFT: on the REAL robot we drive the handle AND the glass +5 cm above the z that depth gives us
-# (the detectors read the FRONT/visible surface, which sits a few cm low; +5 cm is the offset that grabs in
-# real). The detectors are NOT changed -- we apply the lift HERE, as a sim/plan setting, so the motion plan
-# is computed for the heights we actually operate at. Lifting the grasp also clears the table (less clipping).
-Z_LIFT = 0.05
+# ---- Z LIFT: on the REAL robot we drive the targets above the z that depth gives us (the detectors read the
+# FRONT/visible surface, which sits a few cm low). The detectors are NOT changed -- we apply the lift HERE, as
+# a sim/plan setting. HANDLE uses +5 cm. The GLASS uses +7.5 cm: gripping higher up the glass keeps the fingers
+# (and the glass-bottom-derived grasp table, which rides with it) clear of the real counter during the grab.
+Z_LIFT = 0.05            # handle / microwave
+GLASS_Z_LIFT = 0.075     # glass grasp (higher -> fingers clear the counter; the grasp table is based on this)
 
 # ---- GRASP TABLE GAP: the glass-grasp planner needs the table to sit clearly BELOW the glass bottom. If the
 # table touches/overlaps the glass (the grasp TARGET), cuRobo's grasp-goal generation returns None ("the glass
 # is in collision with the table") and EVERY yaw fails -- verified: table top >= glass bottom => FAIL, a clear
 # gap => OK, regardless of grip height. So drop the grasp table this far below the glass bottom. The fingers
 # still grip near the glass base; the +Z_LIFT is what keeps them clear of the REAL table. = plan --table-gap.
-GRASP_TABLE_GAP = 0.03
+GRASP_TABLE_GAP = 0.02
 
 # ---- microwave POSE: from the real perception (fallback = last localised values) -------------------
 def _load_mw_center():
@@ -116,10 +117,10 @@ GLASS_JSON = "/tmp/glass_pose.json"
 def _load_glass():
     try:
         d = json.load(open(GLASS_JSON)); c = d["center"]
-        # +Z_LIFT: grab the glass at the height we actually use on the real robot (depth reads a touch low).
-        return float(c[0]), float(c[1]), float(c[2]) + Z_LIFT, float(d["radius_m"]), float(d["height_m"]), f"perception (/tmp/glass_pose.json) +{Z_LIFT*100:.0f}cm"
+        # +GLASS_Z_LIFT: grip higher up the glass so the fingers clear the counter on the real robot.
+        return float(c[0]), float(c[1]), float(c[2]) + GLASS_Z_LIFT, float(d["radius_m"]), float(d["height_m"]), f"perception (/tmp/glass_pose.json) +{GLASS_Z_LIFT*100:.1f}cm"
     except Exception:
-        return 0.426, -0.281, 0.064 + Z_LIFT, 0.05, 0.109, f"fallback (no /tmp/glass_pose.json) +{Z_LIFT*100:.0f}cm"
+        return 0.426, -0.281, 0.064 + GLASS_Z_LIFT, 0.05, 0.109, f"fallback (no /tmp/glass_pose.json) +{GLASS_Z_LIFT*100:.1f}cm"
 GX, GY, GZ, GR, GH, GLASS_SRC = _load_glass()
 
 
@@ -270,7 +271,7 @@ def main():
     sl_ggy    = server.gui.add_slider("GLASS grasp Y nudge (+ = more right/-y)", min=-0.06, max=0.10, step=0.005, initial_value=0.01)
     _ggz_min, _ggz_max = round(GZ - GH/2, 3), round(GZ + GH/2 + 0.04, 3)   # range tracks THIS glass's height
     sl_ggz    = server.gui.add_slider("GLASS grasp Z (m, grip height)", min=_ggz_min, max=_ggz_max, step=0.005,
-                                      initial_value=round(min(max(0.08, _ggz_min), _ggz_max), 3))  # default 0.08, clamped to this glass's range
+                                      initial_value=round(min(max(0.1, _ggz_min), _ggz_max), 3))  # default 0.08, clamped to this glass's range
     # ---- BRING-BACK staging pose (glass centre after the grasp) -- live, = real_plan_door --bring-back-x/y/z ----
     sl_bbx    = server.gui.add_slider("BRINGBACK X (m)", min=0.15, max=0.50, step=0.005, initial_value=round(SV.BRING_BACK_XYZ[0], 3))
     sl_bby    = server.gui.add_slider("BRINGBACK Y (m)", min=-0.30, max=0.15, step=0.005, initial_value=round(SV.BRING_BACK_XYZ[1], 3))

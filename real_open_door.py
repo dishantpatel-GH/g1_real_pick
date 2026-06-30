@@ -46,12 +46,12 @@ def main():
     ap.add_argument("--to-relaxed-sec", type=float, default=6.0, help="PHASE0 ramp current -> relaxed (slow)")
     ap.add_argument("--relaxed-hold", type=float, default=1.0, help="hold at relaxed before the door motion")
     ap.add_argument("--hz", type=float, default=100.0)
-    ap.add_argument("--speed", type=float, default=0.2, help="door playback speed (<1 slower; 0.1 = very slow). Ctrl-C any time freezes & holds.")
+    ap.add_argument("--speed", type=float, default=0.6, help="playback speed for ALL phases (<1 slower than the planned VMAX; 1.0 = planned). Ctrl-C any time freezes & holds.")
     ap.add_argument("--no-pause", action="store_true", help="skip the ENTER confirmations between phases")
     ap.add_argument("--no-hand", action="store_true", help="do NOT open the left hand (assume already open)")
     ap.add_argument("--no-grab", action="store_true", help="open the door only (skip the right-arm glass grab even if planned)")
     ap.add_argument("--thumb-rot", type=int, default=0, help="RIGHT-hand thumb rotation target for the glass grasp (0 = full opposition)")
-    ap.add_argument("--curl", type=int, default=300, help="RIGHT-hand curl target for the glass grasp (1000=open, smaller=tighter)")
+    ap.add_argument("--curl", type=int, default=250, help="RIGHT-hand curl target for the glass grasp (1000=open, smaller=tighter)")
     ap.add_argument("--rotate-wait", type=float, default=2.5, help="s for the thumb to rotate before the curl")
     ap.add_argument("--grasp-settle", type=float, default=0.8, help="s to hold the grasp after the hand closes")
     ap.add_argument("--release-settle", type=float, default=0.8, help="s to hold after the hand opens (glass released in the microwave)")
@@ -128,10 +128,10 @@ def main():
                     % (T["grab"]["bring_back_xyz"])) if has_grab else ""
         ins_msg = (" -> PHASE3 put glass IN microwave -> release -> retract right to relaxed -> PHASE4 close door + relax left"
                    if has_grab and ("insert" in T["grab"]) and not args.no_insert else "")
-        print("\n[dry-run] would: release mode -> PHASE0 ramp current->relaxed (%.1fs) -> %s%sPHASE1 open door "
+        print("\n[dry-run] would: release mode -> PHASE0 ramp current->relaxed (%.1fs) -> %sPHASE1 open door "
               "(reach->slide->swing, ~%.0f deg)%s%s -> hold. Nothing sent. Add --execute."
               % (args.to_relaxed_sec, "" if args.no_hand else "open LEFT hand -> ",
-                 "" if args.no_pause else "ENTER -> ", T.get("reached_deg", 0), grab_msg, ins_msg))
+                 T.get("reached_deg", 0), grab_msg, ins_msg))
         return
 
     print("\n[execute] moving in 2s. Ctrl-C aborts (freezes).")
@@ -162,10 +162,6 @@ def main():
         hold(relaxed)
         for _ in range(int(args.relaxed_hold * args.hz)): time.sleep(dt)
 
-        # confirmation pause -- the streamer keeps holding `relaxed` while we wait (Ctrl-C aborts/freezes)
-        if not args.no_pause:
-            input("[exec] at RELAXED — inspect, then press ENTER to OPEN the door (Ctrl-C to abort) ...")
-
         # PHASE1: relaxed -> door open (LEFT arm replays; RIGHT arm + legs held at relaxed)
         print(f"[exec] PHASE1 open door ({len(pts)} pts, speed x{args.speed}) -- Ctrl-C any time to freeze ...")
         play(pts, LARM_IDX, relaxed, "door")
@@ -176,8 +172,8 @@ def main():
             while True: time.sleep(0.2)
 
         # PHASE2: RIGHT arm grabs the glass + brings it to the staging pose. LEFT arm HOLDS the door open.
-        # The streamer holds qD/q_grab CONTINUOUSLY through the Hand() init/open and the ENTER pause, so the
-        # arms never lose command at this switch (this is the jerk we were seeing).
+        # The streamer holds qD/q_grab CONTINUOUSLY through the Hand() init/open, so the arms never lose
+        # command at this switch (this is the jerk we were seeing).
         grab = T["grab"]; assert grab["joint_names"] == RARM_NAMES, grab["joint_names"]
         left_hold = np.array(T["left_hold"])
         q_grab = relaxed.copy(); q_grab[LARM_IDX] = left_hold; hold(q_grab)            # hold the LEFT arm at door-open
@@ -186,8 +182,6 @@ def main():
             handR = Hand(); time.sleep(0.5); handR.open(); print("[hand] RIGHT hand opened.")
         except Exception as e:
             print(f"[hand] RIGHT hand unavailable ({e}); continuing — ensure it is open.")
-        if not args.no_pause:
-            input("[exec] door open, holding. Press ENTER to GRAB the glass (Ctrl-C to abort) ...")
         print(f"[exec] PHASE2 grab glass (right arm; left holds door) -- Ctrl-C any time to freeze ...")
         play(grab["approach"], RARM_IDX, q_grab, "approach")
         play(grab["grasp"],    RARM_IDX, q_grab, "grasp")

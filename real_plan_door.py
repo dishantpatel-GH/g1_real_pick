@@ -36,9 +36,9 @@ def main():
     ap.add_argument("--glass", default="/tmp/glass_pose.json", help="glass pose JSON from object_detection.py")
     ap.add_argument("--no-grab", action="store_true", help="plan only the door open (skip the right-arm glass grab)")
     # glass-grasp x/y/z tuning -- the same knobs as microwave_door_open_sim.py's sl_ggx/sl_ggy/sl_ggz sliders
-    ap.add_argument("--glass-x-nudge", type=float, default=0.02, help="glass grasp +x nudge (more ahead); = sim sl_ggx")
-    ap.add_argument("--glass-y-nudge", type=float, default=0.0, help="glass grasp y nudge (subtracted -> + = more right/-y); = sim sl_ggy")
-    ap.add_argument("--glass-grip-z", type=float, default=0.07, help="glass grasp absolute grip height (m); default = glass top - FG_FROMTOP; = sim sl_ggz")
+    ap.add_argument("--glass-x-nudge", type=float, default=0.022, help="glass grasp +x nudge (more ahead); = sim sl_ggx")
+    ap.add_argument("--glass-y-nudge", type=float, default=-0.003, help="glass grasp y nudge (subtracted -> + = more right/-y); = sim sl_ggy")
+    ap.add_argument("--glass-grip-z", type=float, default=0.145, help="glass grasp absolute grip height (m); default = glass top - FG_FROMTOP; = sim sl_ggz")
     ap.add_argument("--table-gap", type=float, default=S.GRASP_TABLE_GAP, help="drop the glass table this far BELOW the glass bottom (m) so it doesn't collide with the glass grasp target; = sim GRASP_TABLE_GAP")
     # bring-back staging pose (glass CENTRE target after the grasp) -- defaults = sim BRING_BACK_XYZ (z +Z_LIFT)
     ap.add_argument("--bring-back-x", type=float, default=None, help="staging x for the grasped glass (m); default = sim BRING_BACK_XYZ[0]")
@@ -174,8 +174,8 @@ def main():
         try:
             G = json.load(open(args.glass)); gc = G["center"]
             gx, gy = float(gc[0]), float(gc[1]); gR = float(G["radius_m"]); gH = float(G["height_m"])
-            gzg = float(gc[2]) + S.Z_LIFT                          # +5cm: grab at the height we actually use in real (= the sim)
-            print(f"[plan] glass: center=({gx:.3f},{gy:.3f},{gzg:.3f}) r={gR*100:.1f}cm h={gH*100:.1f}cm  (z +{S.Z_LIFT*100:.0f}cm above depth)")
+            gzg = float(gc[2]) + S.GLASS_Z_LIFT                    # +7.5cm: grip higher up the glass so fingers clear the counter (= the sim)
+            print(f"[plan] glass: center=({gx:.3f},{gy:.3f},{gzg:.3f}) r={gR*100:.1f}cm h={gH*100:.1f}cm  (z +{S.GLASS_Z_LIFT*100:.1f}cm above depth)")
         except Exception as e:
             print(f"[plan] no glass pose at {args.glass} ({e}); skipping the grab."); G = None
         if G is not None:
